@@ -16,9 +16,10 @@ import urllib.request
 from csv import DictReader
 from datetime import datetime
 from xml.etree.ElementTree import Element, SubElement, Comment, ElementTree
+import edtf
 
 __license__ = "MIT"
-__version__ = '1.5.0'
+__version__ = '1.6.0'
 
 # define log output
 logging.basicConfig(format='%(levelname)s: %(message)s')
@@ -33,10 +34,12 @@ parser = argparse.ArgumentParser(
 parser.add_argument('filename', help='input file (.csv)')
 parser.add_argument('-a', '--all',
                     help='include unedited letters', action='store_true')
-parser.add_argument('--line-numbers',
-                    help='add line numbers', action='store_true')
+parser.add_argument('-n', '--notes', help='transfer notes',
+                    action='store_true')
 parser.add_argument('-v', '--verbose',
                     help='increase output verbosity', action='store_true')
+parser.add_argument('--line-numbers',
+                    help='add line numbers', action='store_true')
 parser.add_argument('--version', action='version',
                     version='%(prog)s ' + __version__)
 args = parser.parse_args()
@@ -44,22 +47,6 @@ args = parser.parse_args()
 # set verbosity
 if args.verbose:
     logs.setLevel('INFO')
-
-
-def checkIsodate(datestring):
-    try:
-        datetime.strptime(datestring, '%Y-%m-%d')
-        return True
-    except ValueError:
-        try:
-            datetime.strptime(datestring, '%Y-%m')
-            return True
-        except ValueError:
-            try:
-                datetime.strptime(datestring, '%Y')
-                return True
-            except ValueError:
-                return False
 
 
 def checkConnectivity():
@@ -168,6 +155,29 @@ def createCorrespondent(namestring):
                             logging.warning(
                                 '%sID in line %s links to undifferentiated Person', namestring, table.line_num)
                             authID = ''
+                elif 'loc' in authID:
+                    try:
+                        locrdf = ElementTree(
+                            file=urllib.request.urlopen(authID + '.rdf'))
+                    except urllib.error.HTTPError:
+                        logging.error(
+                            'Authority file not found for %sID in line %s', namestring, table.line_num)
+                        correspondent = Element('persName')
+                        authID = ''
+                    except urllib.error.URLError:
+                        logging.error('Failed to reach LOC')
+                        correspondent = Element('persName')
+                    else:
+                        locrdf_root = locrdf.getroot()
+                        if locrdf_root.find('.//rdf:type[@rdf:resource="http://id.loc.gov/ontologies/bibframe/Organization"]', rdf) is not None:
+                            correspondent = Element('orgName')
+                        elif locrdf_root.find('.//rdf:type[@rdf:resource="http://id.loc.gov/ontologies/bibframe/Person"]', rdf) is not None:
+                            correspondent = Element('persName')
+                        else:
+                            logging.warning(
+                                '%sID in line %s links to unprocessable authority file', namestring, table.line_num)
+                            correspondent = Element('persName')
+                            authID = ''
                 else:
                     logging.error(
                         'No proper authority record in line %s for %s', table.line_num, namestring)
@@ -182,10 +192,26 @@ def createCorrespondent(namestring):
         if letter[namestring].startswith('[') and letter[namestring].endswith(']'):
             correspondent.set('evidence', 'conjecture')
             letter[namestring] = letter[namestring][1:-1]
-            logging.info('Added @evidence for <persName> in line %s',
+            logging.info('Added @evidence to <%s> from line %s', correspondent.tag,
                          table.line_num)
         correspondent.text = str(letter[namestring])
         return correspondent
+
+
+def createDate(dateString):
+    date = Element('date')
+    normalized_date = dateString.translate(
+        dateString.maketrans('', '', '[]()?~'))
+    if normalized_date != dateString:
+        date.set('cert', 'medium')
+        logging.info(
+            'Added @cert for <date> in line %s', table.line_num)
+    try:
+        date = edtf.parse_edtf(normalized_date)
+        return date
+    except:
+        logging.warning(
+            'date in line %s could not be parsed', table.line_num)
 
 
 def createPlaceName(placestring):
@@ -195,7 +221,7 @@ def createPlaceName(placestring):
     if letter[placestring].startswith('[') and letter[placestring].endswith(']'):
         placeName.set('evidence', 'conjecture')
         letter[placestring] = letter[placestring][1:-1]
-        logging.info('Added @evidence for <placeName> in line %s',
+        logging.info('Added @evidence to <placeName> from line %s',
                      table.line_num)
     placeName.text = str(letter[placestring])
     if (placestring + 'ID' in table.fieldnames) and (letter[placestring + 'ID']):
@@ -203,7 +229,7 @@ def createPlaceName(placestring):
         if 'http://www.geonames.org/' in letter[placestring + 'ID']:
             placeName.set('ref', str(letter[placestring + 'ID']))
         else:
-            logging.warning("no standardized %sID in line %s",
+            logging.warning('No standardized %sID in line %s',
                             placestring, table.line_num)
     else:
         logging.warning('ID for %s missing in line %s', letter[
@@ -304,15 +330,15 @@ with open(args.filename, 'rt') as letterTable:
             if edition and not editionID:
                 editionID = createID('edition')
                 sourceDesc.append(createEdition(edition, editionID))
-        entry = SubElement(profileDesc, 'correspDesc')
-        if (args.line_numbers):
+        entry = Element('correspDesc')
+        if args.line_numbers:
             entry.set('n', str(table.line_num))
         entry.set('xml:id', createID('letter'))
         if edition:
             entry.set('source', '#' + editionID)
         if 'key' in table.fieldnames and letter['key']:
             if not(edition):
-                logging.error("Key without edition in line %s", table.line_num)
+                logging.error('Key without edition in line %s', table.line_num)
             else:
                 if 'http://' in str(letter['key']):
                     entry.set('ref', str(letter['key']).strip())
@@ -320,7 +346,7 @@ with open(args.filename, 'rt') as letterTable:
                     entry.set('key', str(letter['key']).strip())
 
         # sender info block
-        if (letter['sender']) or (('senderPlace' in table.fieldnames) and (letter['senderPlace'])) or (letter['senderDate']):
+        if letter['sender'] or ('senderPlace' in table.fieldnames and letter['senderPlace']) or letter['senderDate']:
             action = SubElement(entry, 'correspAction')
             action.set('xml:id', createID('sender'))
             action.set('type', 'sent')
@@ -333,20 +359,29 @@ with open(args.filename, 'rt') as letterTable:
                 action.append(createPlaceName('senderPlace'))
             # add date
             if 'senderDate' in table.fieldnames:
-                if checkIsodate(letter['senderDate']) or checkIsodate(letter['senderDate'][1:-1]):
+                letter['senderDate'] = letter['senderDate'].translate(
+                    letter['senderDate'].maketrans('', '', '[]()'))
+                print(letter['senderDate'])
+                try:
+                    date = edtf.parse_edtf(letter['senderDate'])
                     senderDate = SubElement(action, 'date')
-                    if letter['senderDate'].startswith('[') and letter['senderDate'].endswith(']'):
-                        senderDate.set('cert', 'medium')
-                        letter['senderDate'] = letter['senderDate'][1:-1]
-                        logging.info(
-                            'Added @cert for <date> in line %s', table.line_num)
-                    senderDate.set('when', str(letter['senderDate']))
-                else:
+                except:
                     logging.warning(
-                        'senderDate in line %s not set (no ISO)', table.line_num)
+                        'senderDate in line %s could not be parsed', table.line_num)
+                if 'Interval' in type(date).__name__:
+                    senderDate.set('from', date.lower.isoformat())
+                    senderDate.set('to', date.upper.isoformat())
+                else:
+                    senderDate.set('when', date.isoformat())
+                if ('?' in letter['senderDate']) or ('~' in letter['senderDate']):
+                    senderDate.set('cert', 'medium')
+                    logging.info(
+                        'Added @cert for <date> in line %s', table.line_num)
+        else:
+            logging.info('No information on sender in line %s', table.line_num)
 
         # addressee info block
-        if letter['addressee'] or 'addresseePlace' in table.fieldnames or (('addresseeDate') in table.fieldnames and (letter['addresseeDate'])):
+        if letter['addressee'] or ('addresseePlace' in table.fieldnames and letter['addresseePlace']) or ('addresseeDate' in table.fieldnames and letter['addresseeDate']):
             action = SubElement(entry, 'correspAction')
             action.set('xml:id', createID('addressee'))
             action.set('type', 'received')
@@ -359,17 +394,34 @@ with open(args.filename, 'rt') as letterTable:
                 action.append(createPlaceName('addresseePlace'))
             # add date
             if 'addresseeDate' in table.fieldnames:
-                if checkIsodate(letter['addresseeDate']) or checkIsodate(letter['addresseeDate'][1:-1]):
-                    addresseeDate = SubElement(action, 'date')
-                    if letter['addresseeDate'].startswith('[') and letter['addresseeDate'].endswith(']'):
-                        senderDate.set('cert', 'medium')
-                        letter['addresseeDate'] = letter['addresseeDate'][1:-1]
-                        logging.info(
-                            'Added @cert for <date> in line %s', table.line_num)
-                    senderDate.set('when', str(letter['addresseeDate']))
-                else:
+                letter['addresseeDate'] = letter['addresseeDate'].translate(
+                    letter['addresseeDate'].maketrans('', '', '[]()'))
+                print(letter['addresseeDate'])
+                try:
+                    date = edtf.parse_edtf(letter['addresseeDate'])
+                    senderDate = SubElement(action, 'date')
+                except:
                     logging.warning(
-                        'addresseeDate in line %s not set (no ISO)', table.line_num)
+                        'addresseeDate in line %s could not be parsed', table.line_num)
+                if 'Interval' in type(date).__name__:
+                    senderDate.set('from', date.lower.isoformat())
+                    senderDate.set('to', date.upper.isoformat())
+                else:
+                    senderDate.set('when', date.isoformat())
+                if ('?' in letter['addresseeDate']) or ('~' in letter['addresseeDate']):
+                    senderDate.set('cert', 'medium')
+                    logging.info(
+                        'Added @cert for <date> in line %s', table.line_num)
+        else:
+            logging.info('No information on addressee in line %s',
+                         table.line_num)
+        if args.notes:
+            if ('note' in table.fieldnames) and letter['note']:
+                note = SubElement(entry, 'note')
+                note.set('xml:id', createID('note'))
+                note.text = str(letter['note'])
+        if entry.find('*'):
+            profileDesc.append(entry)
 
 # generate empty body
 root.append(createTextstructure())
